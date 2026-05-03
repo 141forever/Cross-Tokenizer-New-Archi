@@ -35,6 +35,7 @@ Optimizations:
 import os
 import math
 import logging
+import pdb
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
 from collections import defaultdict
@@ -49,7 +50,7 @@ from transformers import (
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
 )
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -59,42 +60,109 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Alignment Builder
 # ============================================================================
+def _build_alignment_groups_from_ids(student_token_ids, teacher_token_ids,student_tokenizer,teacher_tokenizer):
+        """
+        Build alignment groups using a greedy substring-equality algorithm on decoded token pieces.
+
+        Args:
+            student_token_ids: List[int]
+            teacher_token_ids: List[int]
+
+        Returns:
+            Tuple[List[List[int]], List[List[int]]]: student and teacher alignment groups
+        """
+
+        def to_canonical_pieces(tok, ids):
+            pieces = []
+            prev = ""
+            for k in range(len(ids)):
+                # IMPORTANT: Do NOT skip special tokens - we need to align them too
+                cur = tok.decode(
+                    ids[: k + 1], skip_special_tokens=False, clean_up_tokenization_spaces=False
+                )
+                # Extract the incremental addition (may include spaces/ZWJ/etc.)
+                pieces.append(cur[len(prev) :])
+                prev = cur
+            return pieces
+
+        s_pieces = to_canonical_pieces(student_tokenizer, student_token_ids)
+        t_pieces = to_canonical_pieces(teacher_tokenizer, teacher_token_ids)
+
+        i = j = 0
+        s_buf = t_buf = ""
+        s_group = []
+        t_group = []
+        s_groups = []
+        t_groups = []
+
+        def flush():
+            if s_group and t_group:
+                s_groups.append(s_group.copy())
+                t_groups.append(t_group.copy())
+
+        # Greedily accumulate pieces until substrings match, then flush
+        while i < len(s_pieces) or j < len(t_pieces):
+            if s_buf == t_buf and s_buf != "":
+                flush()
+                s_buf = t_buf = ""
+                s_group = []
+                t_group = []
+                continue
+
+            if s_buf == "" and i < len(s_pieces):
+                s_buf += s_pieces[i]
+                s_group.append(i)
+                i += 1
+                continue
+            if t_buf == "" and j < len(t_pieces):
+                t_buf += t_pieces[j]
+                t_group.append(j)
+                j += 1
+                continue
+
+            if len(s_buf) <= len(t_buf):
+                if i < len(s_pieces):
+                    s_buf += s_pieces[i]
+                    s_group.append(i)
+                    i += 1
+                elif j < len(t_pieces):
+                    t_buf += t_pieces[j]
+                    t_group.append(j)
+                    j += 1
+            else:
+                if j < len(t_pieces):
+                    t_buf += t_pieces[j]
+                    t_group.append(j)
+                    j += 1
+                elif i < len(s_pieces):
+                    s_buf += s_pieces[i]
+                    s_group.append(i)
+                    i += 1
+
+        # Flush any remainder if both sides accumulated something
+        if s_buf == t_buf and s_group and t_group:
+            flush()
+        elif s_group or t_group:
+            # Handle remaining unmatched tokens by forcing a flush
+            # This ensures both sides have the same number of alignment groups
+            if s_group or t_group:
+                # Ensure both groups have content (even if empty list)
+                if not s_group:
+                    s_group = []
+                if not t_group:
+                    t_group = []
+                # Force flush even if buffers don't match
+                if s_group or t_group:
+                    s_groups.append(s_group.copy() if s_group else [])
+                    t_groups.append(t_group.copy() if t_group else [])
+
+        return s_groups, t_groups
 
 def build_alignment_groups(text, student_tok, teacher_tok):
     """Build token groups that decode to the same substring."""
     s_ids = student_tok.encode(text, add_special_tokens=False)
     t_ids = teacher_tok.encode(text, add_special_tokens=False)
-    s_groups, t_groups = [], []
-    si = ti = 0
-
-    while si < len(s_ids) and ti < len(t_ids):
-        se, te = si + 1, ti + 1
-        sd = student_tok.decode(s_ids[si:se], skip_special_tokens=True)
-        td = teacher_tok.decode(t_ids[ti:te], skip_special_tokens=True)
-        for _ in range(300):
-            if sd == td:
-                break
-            if len(sd) <= len(td):
-                se += 1
-                if se > len(s_ids):
-                    te += 1
-                    if te > len(t_ids): break
-            else:
-                te += 1
-                if te > len(t_ids):
-                    se += 1
-                    if se > len(s_ids): break
-            sd = student_tok.decode(s_ids[si:min(se, len(s_ids))], skip_special_tokens=True)
-            td = teacher_tok.decode(t_ids[ti:min(te, len(t_ids))], skip_special_tokens=True)
-
-        se, te = min(se, len(s_ids)), min(te, len(t_ids))
-        s_groups.append(list(range(si, se)))
-        t_groups.append(list(range(ti, te)))
-        si, ti = se, te
-
-    if si < len(s_ids) or ti < len(t_ids):
-        s_groups.append(list(range(si, len(s_ids))))
-        t_groups.append(list(range(ti, len(t_ids))))
+    s_groups, t_groups = _build_alignment_groups_from_ids(s_ids, t_ids, student_tok, teacher_tok)
 
     return s_ids, t_ids, s_groups, t_groups
 
@@ -164,10 +232,8 @@ def build_teacher_sequences_optimized(
         pos_in_group = sg.index(si)
         within_prefix = []
         if pos_in_group > 0:
-            frac = pos_in_group / len(sg)
-            n_t = max(1, int(frac * len(tg)))
-            within_prefix = [teacher_ids[tg[k]] for k in range(n_t)]
-
+            for ii in range(0,pos_in_group):
+                within_prefix += expand_map[si+ii-pos_in_group]
         expanded = expand_map[si]
         seq = prefix + within_prefix + expanded
 
@@ -271,46 +337,34 @@ class ProjectionHead(nn.Module):
 # ============================================================================
 
 class PreprocessedDataset(Dataset):
-    def __init__(self, texts, student_tok, teacher_tok, max_tokens=512):
-        self.data = []
+    def __init__(self, texts, student_tok, teacher_tok, max_tokens=4096):
+        self._data = []
         for text in tqdm(texts, desc="Preprocessing"):
             try:
                 s_ids, t_ids, sg, tg = build_alignment_groups(text, student_tok, teacher_tok)
                 if not s_ids or not t_ids:
                     continue
-
-                # Truncate by group boundary
-                if len(s_ids) > max_tokens:
-                    cum = 0
-                    cut = 0
-                    for gi, g in enumerate(sg):
-                        cum += len(g)
-                        if cum > max_tokens:
-                            cut = gi
-                            break
-                    else:
-                        cut = len(sg)
-                    cut = max(cut, 1)
-                    sg = sg[:cut]
-                    tg = tg[:cut]
-                    s_ids = s_ids[:max(max(g) for g in sg) + 1]
-                    t_ids = t_ids[:max(max(g) for g in tg) + 1]
+                if len(s_ids) > max_tokens or len(t_ids) > max_tokens:
+                    continue
 
                 em = expand_student_tokens(s_ids, student_tok, teacher_tok)
-                self.data.append({
+                self._data.append({
                     "s_ids": s_ids, "t_ids": t_ids,
                     "sg": sg, "tg": tg, "em": em,
                 })
             except Exception:
                 continue
 
-        logger.info(f"Dataset: {len(self.data)}/{len(texts)} samples ready")
+        logger.info(f"Dataset: {len(self._data)}/{len(texts)} samples ready")
 
     def __len__(self):
-        return len(self.data)
+        return len(self._data)
 
     def __getitem__(self, i):
-        return self.data[i]
+        return self._data[i]
+    
+    def __getitems__(self, indices):
+        return [self._data[i] for i in indices]
 
 
 # ============================================================================
@@ -373,15 +427,15 @@ def run(cfg: Config):
 
     # Data
     logger.info("Loading data...")
-    ds = load_dataset(cfg.dataset_name, cfg.dataset_subset, split="train", streaming=True)
+    ds = Dataset.from_parquet(cfg.dataset_name)
     texts = []
     for i, x in enumerate(ds):
-        if i >= cfg.max_samples:
+        if i >= cfg.max_samples and cfg.max_samples != -1:
             break
         t = x.get(cfg.text_col, "")
         if len(t.strip()) > 20:
-            texts.append(t[:4096])
-
+            texts.append(t)
+            
     dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens)
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
                         collate_fn=lambda b: b, num_workers=0)
@@ -482,22 +536,24 @@ if __name__ == "__main__":
     pa.add_argument("--dataset_name", default="HuggingFaceTB/smollm-corpus")
     pa.add_argument("--dataset_subset", default="cosmopedia-v2")
     pa.add_argument("--text_col", default="text")
-    pa.add_argument("--max_samples", type=int, default=10000)
+    pa.add_argument("--max_samples", type=int, default=-1)
     pa.add_argument("--max_tokens", type=int, default=512)
     pa.add_argument("--batch_size", type=int, default=4)
     pa.add_argument("--teacher_bsz", type=int, default=32)
-    pa.add_argument("--lr", type=float, default=1e-3)
-    pa.add_argument("--epochs", type=int, default=3)
+    pa.add_argument("--lr", type=float, default=1e-5)
+    pa.add_argument("--epochs", type=int, default=1)
     pa.add_argument("--grad_accum", type=int, default=4)
     pa.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16"])
     pa.add_argument("--output_dir", default="output_projection")
-    a = pa.parse_args()
+    args = pa.parse_args()
 
     run(Config(
-        student_model=a.student_model, teacher_model=a.teacher_model,
-        dataset_name=a.dataset_name, dataset_subset=a.dataset_subset,
-        text_col=a.text_col, max_samples=a.max_samples, max_tokens=a.max_tokens,
-        batch_size=a.batch_size, teacher_bsz=a.teacher_bsz, lr=a.lr,
-        epochs=a.epochs, grad_accum=a.grad_accum, dtype=a.dtype,
-        output_dir=a.output_dir,
+        student_model=args.student_model, teacher_model=args.teacher_model,
+        dataset_name=args.dataset_name, dataset_subset=args.dataset_subset,
+        text_col=args.text_col, max_samples=args.max_samples, max_tokens=args.max_tokens,
+        batch_size=args.batch_size, teacher_bsz=args.teacher_bsz, lr=args.lr,
+        epochs=args.epochs, grad_accum=args.grad_accum, dtype=args.dtype,
+        output_dir=args.output_dir,
     ))
+    
+# python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output  --max_samples 100 --text_col text
