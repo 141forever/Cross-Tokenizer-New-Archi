@@ -35,7 +35,6 @@ Optimizations:
 import os
 import math
 import logging
-import json
 import pdb
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
@@ -179,312 +178,144 @@ def expand_student_tokens(student_ids, student_tok, teacher_tok):
         expand_map.append(t_ids)
     return expand_map
 
+
 # ============================================================================
-# [OPT-3] Super-sequence builder + single-pass teacher forward
+# Optimized: Build teacher sequences with prefix sharing
 # ============================================================================
-def build_single_supersequence(
+
+def build_teacher_sequences_optimized(
     student_ids: List[int],
     teacher_ids: List[int],
     s_groups: List[List[int]],
     t_groups: List[List[int]],
     expand_map: List[List[int]],
     max_seq_len: int = 2048,
-) -> Tuple[List[int], torch.Tensor, List[int], List[int]]:
+) -> Tuple[List[List[int]], List[int]]:
     """
-    Compress N teacher sequences into 1 super-sequence + 2D attention mask.
- 
-    Super-sequence layout (per group g):
-        [group_g original teacher prefix tokens] [exp(s_i) for each s_i in group g]
- 
-    Attention mask ensures each extraction point sees exactly the same context
-    as the original per-token sequence would have provided.
- 
-    Returns:
-        super_tokens:    List[int]   - token ids for the super-sequence
-        attn_mask:       Tensor (L, L) bool - True = can attend
-        extract_pos:     List[int]   - positions to extract hidden states from
-        valid_si:        List[int]   - which student indices these correspond to
-    """
-    # Build student_idx -> (group_idx, position_in_group)
-    s2g = {}
-    s2p = {}
-    for gi, sg in enumerate(s_groups):
-        for p, si in enumerate(sg):
-            s2g[si] = gi
-            s2p[si] = p
- 
-    # === Lay out the super-sequence ===
-    super_tokens = []
-    tok_group = []        # group index for each position
-    tok_is_expand = []    # True if expand token, False if prefix token
-    tok_owner_si = []     # student idx if expand, -1 if prefix
-    tok_ingroup_pos = []  # position-in-group of the owning student token, -1 if prefix
- 
-    extract_positions = {}  # student_idx -> position in super_seq
- 
-    for gi in range(len(s_groups)):
-        # Group prefix: original teacher tokens
-        for ti in t_groups[gi]:
-            super_tokens.append(teacher_ids[ti])
-            tok_group.append(gi)
-            tok_is_expand.append(False)
-            tok_owner_si.append(-1)
-            tok_ingroup_pos.append(-1)
- 
-        # Each student token's expand in this group
-        for si in s_groups[gi]:
-            p_in_g = s2p[si]
-            for tok_id in expand_map[si]:
-                super_tokens.append(tok_id)
-                tok_group.append(gi)
-                tok_is_expand.append(True)
-                tok_owner_si.append(si)
-                tok_ingroup_pos.append(p_in_g)
-            # Extract from the last token of this expand
-            extract_positions[si] = len(super_tokens) - 1
- 
-    L = len(super_tokens)
- 
-    # Truncation fallback: if too long, we can't do single-pass.
-    # Return empty to signal caller should fall back to original method.
-    if L > max_seq_len * 2:
-        return [], None, [], []
- 
-    # === Build 2D attention mask (vectorized) ===
-    t_group_t = torch.tensor(tok_group, dtype=torch.long)
-    t_is_exp = torch.tensor(tok_is_expand, dtype=torch.bool)
-    t_is_pfx = ~t_is_exp
-    t_igp = torch.tensor(tok_ingroup_pos, dtype=torch.long)  # in-group position
- 
-    # (L,1) vs (1,L) broadcasting for pairwise comparisons
-    gi_q = t_group_t.unsqueeze(1)   # query groups  (L, 1)
-    gi_k = t_group_t.unsqueeze(0)   # key groups    (1, L)
-    exp_k = t_is_exp.unsqueeze(0)   # key is expand (1, L)
-    pfx_k = t_is_pfx.unsqueeze(0)   # key is prefix (1, L)
-    igp_q = t_igp.unsqueeze(1)      # query in-group pos (L, 1)
-    igp_k = t_igp.unsqueeze(0)      # key in-group pos   (1, L)
- 
-    pos = torch.arange(L)
-    causal = pos.unsqueeze(0).T >= pos.unsqueeze(0)  # (L, L), causal[i,j] = (i >= j)
- 
-    # --- Rules for PREFIX query positions ---
-    # Can see: earlier groups (all) | same group prefix (causal only)
-    pfx_rule = ((gi_k < gi_q) & pfx_k) | ((gi_k == gi_q) & pfx_k & causal)
- 
-    # --- Rules for EXPAND query positions ---
-    # Can see:
-    #   1) All tokens from earlier groups
-    #   2) Same group, expand, earlier in-group position (all tokens of that expand)
-    #   3) Same group, expand, same in-group position, causal
-    #   4) Same group PREFIX: NOT visible (matches original code's prefix logic)
-    exp_rule = (
-        ((gi_k < gi_q) & pfx_k)
-        | ((gi_k == gi_q) & exp_k & (igp_k < igp_q))
-        | ((gi_k == gi_q) & exp_k & (igp_k == igp_q) & causal)
-    )
- 
-    # Combine: use prefix rule for prefix queries, expand rule for expand queries
-    is_pfx_q = t_is_pfx.unsqueeze(1).expand(L, L)
-    attn_mask = torch.where(is_pfx_q, pfx_rule, exp_rule)
- 
-    # === Collect extraction positions in student_ids order ===
-    extract_pos_list = []
-    valid_si_list = []
-    for si in range(len(student_ids)):
-        if si in extract_positions:
-            extract_pos_list.append(extract_positions[si])
-            valid_si_list.append(si)
- 
-    return super_tokens, attn_mask, extract_pos_list, valid_si_list
- 
- 
-@torch.no_grad()
-def teacher_forward_superseq(
-    model: nn.Module,
-    super_seq: List[int],
-    attn_mask_2d: torch.Tensor,
-    extract_positions: List[int],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    [OPT-3] Single forward pass on the super-sequence.
+    For each student token, build input = teacher_prefix + expanded_tokens.
     
-    Returns: (N, hidden_dim) float32 tensor, one hidden state per extraction point.
+    Prefix rule: for student token ts_i in group g:
+        prefix = [original teacher tokens for groups 0..g-1]
+        (within-group prefix is NOT expanded, using original teacher tokens)
+    Then append expand_map[i] (the expanded teacher tokens for ts_i).
+    Target = last position in the sequence.
     """
-    model.eval()
-    pdb.set_trace()
-    L = len(super_seq)
- 
-    input_ids = torch.tensor([super_seq], dtype=torch.long, device=device)  # (1, L)
- 
-    # Convert bool mask to 4D float attention mask:
-    # HuggingFace convention: 0.0 = attend, -inf = masked
-    # Shape: (1, 1, L, L) — broadcast over batch and heads
-    mask_4d = attn_mask_2d.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,L,L) bool
-    attn_mask_float = torch.where(
-        mask_4d,
-        torch.tensor(0.0, dtype=dtype, device=device),
-        torch.tensor(float('-inf'), dtype=dtype, device=device),
-    )
- 
-    with torch.amp.autocast("cuda", dtype=dtype):
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attn_mask_float,
-            output_hidden_states=True,
-            use_cache=False,
-        )
- 
-    last_hidden = outputs.hidden_states[-1]  # (1, L, hdim)
-    positions = torch.tensor(extract_positions, dtype=torch.long, device=device)
-    extracted = last_hidden[0, positions].float()  # (N, hdim)
- 
-    del outputs, last_hidden, input_ids, mask_4d, attn_mask_float
-    torch.cuda.empty_cache()
- 
-    return extracted
-
-# ============================================================================
-# Original teacher forward (kept as fallback for long sequences)
-# ============================================================================
-def build_teacher_sequences_optimized(
-    student_ids, teacher_ids, s_groups, t_groups, expand_map, max_seq_len=2048,
-):
-    """Original per-token sequence builder — used as fallback when super-seq is too long."""
+    # Map student idx → group idx
     s2g = {}
     for gi, sg in enumerate(s_groups):
         for si in sg:
             s2g[si] = gi
- 
-    group_prefix_cache = [[]]
+
+    # Precompute cumulative teacher prefix per group
+    # group_prefix_end[g] = list of teacher token ids for groups 0..g-1
+    group_prefix_cache = [[]]  # group 0 has empty prefix
     cumulative = []
     for gi in range(len(t_groups)):
         for ti in t_groups[gi]:
             cumulative.append(teacher_ids[ti])
         group_prefix_cache.append(list(cumulative))
- 
+
     all_seqs = []
     all_tgt_pos = []
- 
+
     for si in range(len(student_ids)):
         gi = s2g.get(si, -1)
         if gi < 0:
             continue
+
+        # Prefix = teacher tokens for completed groups
         prefix = group_prefix_cache[gi]
+
+        # Within-group: add original teacher tokens for student tokens before si
         sg = s_groups[gi]
+        tg = t_groups[gi]
         pos_in_group = sg.index(si)
         within_prefix = []
         if pos_in_group > 0:
-            for ii in range(0, pos_in_group):
-                within_prefix += expand_map[si + ii - pos_in_group]
+            for ii in range(0,pos_in_group):
+                within_prefix += expand_map[si+ii-pos_in_group]
         expanded = expand_map[si]
         seq = prefix + within_prefix + expanded
+
+        # Truncate from the left if too long
         if len(seq) > max_seq_len:
             seq = seq[-max_seq_len:]
+
         all_seqs.append(seq)
         all_tgt_pos.append(len(seq) - 1)
- 
+
     return all_seqs, all_tgt_pos
- 
- 
+
+
+# ============================================================================
+# Batched Teacher Forward with Length-Sorted Packing
+# ============================================================================
+
 @torch.no_grad()
 def teacher_forward_batched(
-    model, sequences, target_positions, batch_size, device, dtype,
-):
-    """Original batched forward — used as fallback."""
+    model: nn.Module,
+    sequences: List[List[int]],
+    target_positions: List[int],
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Efficient batched teacher forward. Returns (N, hidden_dim) fp32 tensor."""
     model.eval()
     N = len(sequences)
     if N == 0:
         return torch.zeros(0)
+
     hidden_dim = model.config.hidden_size
+
+    # Sort by length for better packing (less padding waste)
     indices = sorted(range(N), key=lambda i: len(sequences[i]))
     sorted_seqs = [sequences[i] for i in indices]
     sorted_tgts = [target_positions[i] for i in indices]
+
+    # Allocate output buffer
     out = torch.zeros(N, hidden_dim, dtype=torch.float32, device=device)
- 
+
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
         batch_seqs = sorted_seqs[start:end]
         batch_tgts = sorted_tgts[start:end]
         bsz = len(batch_seqs)
+
         max_len = max(len(s) for s in batch_seqs)
+
+        # Right-align (left-pad) for causal LM
         input_ids = torch.zeros(bsz, max_len, dtype=torch.long, device=device)
         attn_mask = torch.zeros(bsz, max_len, dtype=torch.long, device=device)
         adjusted_tgts = []
+
         for i, seq in enumerate(batch_seqs):
             pad = max_len - len(seq)
             input_ids[i, pad:] = torch.tensor(seq, dtype=torch.long, device=device)
             attn_mask[i, pad:] = 1
             adjusted_tgts.append(batch_tgts[i] + pad)
+
         with torch.amp.autocast("cuda", dtype=dtype):
             outputs = model(
-                input_ids=input_ids, attention_mask=attn_mask,
-                output_hidden_states=True, use_cache=False,
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                output_hidden_states=True,
+                use_cache=False,
             )
-        last_hidden = outputs.hidden_states[-1]
+
+        last_hidden = outputs.hidden_states[-1]  # (bsz, max_len, hdim)
         for i in range(bsz):
             out[start + i] = last_hidden[i, adjusted_tgts[i]].float()
+
         del outputs, last_hidden, input_ids, attn_mask
         torch.cuda.empty_cache()
- 
+
+    # Unsort back to original order
     result = torch.zeros_like(out)
     for new_idx, orig_idx in enumerate(indices):
         result[orig_idx] = out[new_idx]
-    return result
 
-# ============================================================================
-# [OPT-3] Unified teacher hidden state extraction
-# ============================================================================
-def get_teacher_hidden_states(
-    sample: dict,
-    model: nn.Module,
-    max_seq_len: int,
-    teacher_bsz: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Get teacher hidden states for all student tokens in a sample.
-    
-    Tries the optimized single super-sequence path first [OPT-3].
-    Falls back to the original N-sequence batched path if the super-sequence
-    exceeds max_seq_len.
-    
-    Returns: (n, hidden_dim) tensor where n = len(student_ids)
-    """
-    s_ids = sample["s_ids"]
-    t_ids = sample["t_ids"]
-    sg = sample["sg"]
-    tg = sample["tg"]
-    em = sample["em"]
-    n = len(s_ids)
-    hdim = model.config.hidden_size
- 
-    # --- Try super-sequence path ---
-    super_tokens, attn_mask, extract_pos, valid_si = build_single_supersequence(
-        s_ids, t_ids, sg, tg, em, max_seq_len
-    )
- 
-    if super_tokens and len(super_tokens) > 0:
-        # Super-sequence fits within max_seq_len: single forward pass
-        hidden = teacher_forward_superseq(
-            model, super_tokens, attn_mask, extract_pos, device, dtype
-        )
-        # Map back to full student_ids ordering
-        result = torch.zeros(n, hdim, dtype=torch.float32, device=device)
-        for idx, si in enumerate(valid_si):
-            result[si] = hidden[idx]
-        return result
- 
-    # --- Fallback: original N-sequence batched path ---
-    seqs, tgt_pos = build_teacher_sequences_optimized(
-        s_ids, t_ids, sg, tg, em, max_seq_len
-    )
-    if not seqs:
-        return torch.zeros(n, hdim, dtype=torch.float32, device=device)
- 
-    return teacher_forward_batched(model, seqs, tgt_pos, teacher_bsz, device, dtype)
+    return result
 
 
 # ============================================================================
@@ -508,32 +339,21 @@ class ProjectionHead(nn.Module):
 class PreprocessedDataset(Dataset):
     def __init__(self, texts, student_tok, teacher_tok, max_tokens=4096):
         self._data = []
-        # for text in tqdm(texts, desc="Preprocessing"):
-        #     try:
-        #         # s_ids, t_ids, sg, tg = build_alignment_groups(text, student_tok, teacher_tok)
-        #         # if not s_ids or not t_ids:
-        #         #     continue
-        #         # if len(s_ids) > max_tokens or len(t_ids) > max_tokens:
-        #         #     continue
+        for text in tqdm(texts, desc="Preprocessing"):
+            try:
+                s_ids, t_ids, sg, tg = build_alignment_groups(text, student_tok, teacher_tok)
+                if not s_ids or not t_ids:
+                    continue
+                if len(s_ids) > max_tokens or len(t_ids) > max_tokens:
+                    continue
 
-        #         # em = expand_student_tokens(s_ids, student_tok, teacher_tok)
-        #         # self._data.append({
-        #         #     "s_ids": s_ids, "t_ids": t_ids,
-        #         #     "sg": sg, "tg": tg, "em": em,
-        #         # })
-                
-        #         # with open("/inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrained1.jsonl", "a", encoding="utf-8") as f:
-        #         #     item = {
-        #         #     "s_ids": s_ids, "t_ids": t_ids,
-        #         #     "sg": sg, "tg": tg, "em": em,
-        #         # }
-        #         #     f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        #     except Exception:
-        #         continue
-        with open("/inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrained1.jsonl", "r", encoding="utf-8") as f:
-            for line in f:
-                item = json.loads(line)
-                self._data.append(item)
+                em = expand_student_tokens(s_ids, student_tok, teacher_tok)
+                self._data.append({
+                    "s_ids": s_ids, "t_ids": t_ids,
+                    "sg": sg, "tg": tg, "em": em,
+                })
+            except Exception:
+                continue
 
         logger.info(f"Dataset: {len(self._data)}/{len(texts)} samples ready")
 
@@ -617,7 +437,6 @@ def run(cfg: Config):
             texts.append(t)
             
     dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens)
-    pdb.set_trace()
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
                         collate_fn=lambda b: b, num_workers=0)
 
@@ -645,11 +464,17 @@ def run(cfg: Config):
                 if n < 2:  # need at least 2 tokens for NTP
                     continue
 
-                t_hidden = get_teacher_hidden_states(
-                    sample, t_model, cfg.max_seq_len, cfg.teacher_bsz, dev, dt
+                # Teacher hidden states
+                seqs, tgt_pos = build_teacher_sequences_optimized(
+                    s_ids, t_ids, sample["sg"], sample["tg"],
+                    sample["em"], cfg.max_seq_len,
+                )
+                if not seqs:
+                    continue
+
+                t_hidden = teacher_forward_batched(
+                    t_model, seqs, tgt_pos, cfg.teacher_bsz, dev, dt
                 )  # (n, hdim)
- 
-                assert t_hidden.shape[0] == n
 
                 assert t_hidden.shape[0] == n
 
@@ -713,7 +538,6 @@ if __name__ == "__main__":
     pa.add_argument("--text_col", default="text")
     pa.add_argument("--max_samples", type=int, default=-1)
     pa.add_argument("--max_tokens", type=int, default=512)
-    pa.add_argument("--max_seq_len", type=int, default=2048)
     pa.add_argument("--batch_size", type=int, default=4)
     pa.add_argument("--teacher_bsz", type=int, default=32)
     pa.add_argument("--lr", type=float, default=1e-5)
