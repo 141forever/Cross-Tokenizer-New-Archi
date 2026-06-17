@@ -560,7 +560,6 @@ class PreprocessedDataset(Dataset):
             with open(cache_path, "wb") as f:
                 pickle.dump(self._data, f, protocol=pickle.HIGHEST_PROTOCOL)
             logger.info(f"Cache saved to {cache_path}")
-        pdb.set_trace()
         logger.info(f"Dataset: {len(self._data)}/{len(texts)} samples ready")
 
     def __len__(self):
@@ -652,18 +651,13 @@ def run(cfg: Config):
             texts.append(t)
             
     cache = cfg.cache_path if cfg.cache_path else None
-    if rank == 0:
-        dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens, cfg.if_write_cache,
-                                        cache_path=cache)
-    dist.barrier()          # 等 rank 0 把缓存写好
-    if rank != 0:
-        dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens, cfg.if_write_cache,
-                                        cache_path=cache)
     
+    dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens, cfg.if_write_cache,
+                              cache_path=cache)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
-                                 shuffle=True, drop_last=True)
+                             shuffle=True, drop_last=True)
     loader  = DataLoader(dataset, batch_size=cfg.batch_size, sampler=sampler,
-                         collate_fn=lambda b: b, num_workers=0)
+                     collate_fn=lambda b: b, num_workers=0)
 
     # Optimizer
     opt = torch.optim.AdamW(proj_ddp.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
@@ -696,8 +690,6 @@ def run(cfg: Config):
                 )  # (n, hdim)
                 t_hidden = t_hidden.to(dev)
  
-                assert t_hidden.shape[0] == n
-
                 assert t_hidden.shape[0] == n
 
                 # Projection → NTP Cross-Entropy
@@ -788,4 +780,6 @@ if __name__ == "__main__":
     
 # torchrun --nproc_per_node=4 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
 
-# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl --if_write_cache
+# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
+
+# python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
