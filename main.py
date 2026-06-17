@@ -366,97 +366,6 @@ def teacher_forward_superseq(
  
     return extracted
 
-# ============================================================================
-# Original teacher forward (kept as fallback for long sequences)
-# ============================================================================
-def build_teacher_sequences_optimized(
-    student_ids, teacher_ids, s_groups, t_groups, expand_map, max_seq_len=2048,
-):
-    """Original per-token sequence builder — used as fallback when super-seq is too long."""
-    s2g = {}
-    for gi, sg in enumerate(s_groups):
-        for si in sg:
-            s2g[si] = gi
- 
-    group_prefix_cache = [[]]
-    cumulative = []
-    for gi in range(len(t_groups)):
-        for ti in t_groups[gi]:
-            cumulative.append(teacher_ids[ti])
-        group_prefix_cache.append(list(cumulative))
- 
-    all_seqs = []
-    all_tgt_pos = []
- 
-    for si in range(len(student_ids)):
-        gi = s2g.get(si, -1)
-        if gi < 0:
-            continue
-        prefix = group_prefix_cache[gi]
-        sg = s_groups[gi]
-        pos_in_group = sg.index(si)
-        within_prefix = []
-        if pos_in_group > 0:
-            for ii in range(0, pos_in_group):
-                within_prefix += expand_map[si + ii - pos_in_group]
-        expanded = expand_map[si]
-        seq = prefix + within_prefix + expanded
-        if len(seq) > max_seq_len:
-            seq = seq[-max_seq_len:]
-        all_seqs.append(seq)
-        all_tgt_pos.append(len(seq) - 1)
- 
-    return all_seqs, all_tgt_pos
- 
- 
-@torch.no_grad()
-def teacher_forward_batched(
-    model, sequences, target_positions, batch_size, device, dtype,
-):
-    """Original batched forward — used as fallback."""
-    model.eval()
-    N = len(sequences)
-    if N == 0:
-        return torch.zeros(0)
-    hidden_dim = model.config.hidden_size
-    indices = sorted(range(N), key=lambda i: len(sequences[i]))
-    sorted_seqs = [sequences[i] for i in indices]
-    sorted_tgts = [target_positions[i] for i in indices]
-    out = torch.zeros(N, hidden_dim, dtype=torch.float32, device=device)
- 
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        batch_seqs = sorted_seqs[start:end]
-        batch_tgts = sorted_tgts[start:end]
-        bsz = len(batch_seqs)
-        max_len = max(len(s) for s in batch_seqs)
-        input_ids = torch.zeros(bsz, max_len, dtype=torch.long, device=device)
-        attn_mask = torch.zeros(bsz, max_len, dtype=torch.long, device=device)
-        adjusted_tgts = []
-        for i, seq in enumerate(batch_seqs):
-            pad = max_len - len(seq)
-            input_ids[i, pad:] = torch.tensor(seq, dtype=torch.long, device=device)
-            attn_mask[i, pad:] = 1
-            adjusted_tgts.append(batch_tgts[i] + pad)
-        with torch.amp.autocast("cuda", dtype=dtype):
-            outputs = model(
-                input_ids=input_ids, attention_mask=attn_mask,
-                output_hidden_states=True, use_cache=False,
-            )
-        last_hidden = outputs.hidden_states[-1]
-        for i in range(bsz):
-            out[start + i] = last_hidden[i, adjusted_tgts[i]].float()
-        del outputs, last_hidden, input_ids, attn_mask
-        torch.cuda.empty_cache()
- 
-    result = torch.zeros_like(out)
-    for new_idx, orig_idx in enumerate(indices):
-        result[orig_idx] = out[new_idx]
-    return result
-
-# ============================================================================
-# [OPT-3] Unified teacher hidden state extraction
-# ============================================================================
 def get_teacher_hidden_states(
     sample: dict,
     model: nn.Module,
@@ -497,15 +406,6 @@ def get_teacher_hidden_states(
         for idx, si in enumerate(valid_si):
             result[si] = hidden[idx]
         return result
- 
-    # --- Fallback: original N-sequence batched path ---
-    seqs, tgt_pos = build_teacher_sequences_optimized(
-        s_ids, t_ids, sg, tg, em, max_seq_len
-    )
-    if not seqs:
-        return torch.zeros(n, hdim, dtype=torch.float32, device=device)
- 
-    return teacher_forward_batched(model, seqs, tgt_pos, teacher_bsz, device, dtype)
 
 
 # ============================================================================
