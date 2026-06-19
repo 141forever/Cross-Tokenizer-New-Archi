@@ -1,3 +1,37 @@
+"""
+Cross-Tokenizer Projection Head Trainer (Stage 1)
+===================================================
+
+Goal: Train a linear projection W: teacher_hidden_dim → student_vocab_size
+so that teacher's representations can predict student token sequences (NTP loss).
+
+After training, W replaces the teacher's lm_head, enabling same-vocab KL distillation
+in Stage 2 (teacher+W → student).
+
+Pipeline:
+1. text → student_tokenizer → student_ids (n tokens, g groups)
+   text → teacher_tokenizer → teacher_ids (m tokens, g groups)
+   Build alignment groups so s_groups[i] ↔ t_groups[i] decode to same string.
+
+2. Per student token: decode → re-tokenize with teacher_tokenizer → expand_map.
+
+3. Teacher forward with hybrid prefix (original teacher tokens as prefix,
+   expanded tokens for current position) → extract last hidden states.
+
+4. proj_logits = W(teacher_hidden)   shape: (n, student_vocab_size)
+   labels = student_ids shifted       (standard next-token prediction)
+   loss = CrossEntropy(proj_logits[:-1], student_ids[1:])
+
+Only W is trained. Both teacher backbone and student tokenizer are frozen.
+Student MODEL is NOT loaded — only its tokenizer is needed.
+
+Optimizations:
+- Length-sorted batching to reduce padding waste
+- Mixed precision teacher forward
+- Gradient accumulation
+- Per-sample GPU memory cleanup
+"""
+
 import os
 import math
 import logging
@@ -29,7 +63,9 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-
+# ============================================================================
+# Set ddp
+# ============================================================================
 def setup_ddp():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -44,6 +80,9 @@ def cleanup_ddp():
 def is_main(rank):
     return rank == 0
 
+# ============================================================================
+# Alignment Builder
+# ============================================================================
 def _build_alignment_groups_from_ids(student_token_ids, teacher_token_ids,student_tokenizer,teacher_tokenizer):
         """
         Build alignment groups using a greedy substring-equality algorithm on decoded token pieces.
@@ -162,6 +201,9 @@ def expand_student_tokens(student_ids, student_tok, teacher_tok):
         expand_map.append(t_ids)
     return expand_map
 
+# ============================================================================
+# [OPT-3] Super-sequence builder + single-pass teacher forward
+# ============================================================================
 def build_single_supersequence(
     student_ids: List[int],
     teacher_ids: List[int],
@@ -169,257 +211,122 @@ def build_single_supersequence(
     t_groups: List[List[int]],
     expand_map: List[List[int]],
     max_seq_len: int = 2048,
-) -> Tuple[List[int], Optional[torch.Tensor], List[int], List[int], List[int]]:
+) -> Tuple[List[int], torch.Tensor, List[int], List[int],List[int]]:
     """
-    Build a two-block super-sequence:
-
-        P block:
-            [all original Qwen teacher tokens]
-            = teacher_ids
-
-        E block:
-            [all Llama-token pieces expanded into Qwen tokens]
-            = expand_map[0] + expand_map[1] + ... + expand_map[n-1]
-
-    The physical token ids are more natural than the old interleaved layout:
-
-        old:
-            P_g0, E_g0, P_g1, E_g1, ...
-
-        new:
-            P_g0, P_g1, ..., P_gn, E_g0, E_g1, ..., E_gn
-
-    But the attention mask makes each E query see exactly the same logical
-    context as the original per-token hybrid-prefix sequence.
-
+    Compress N teacher sequences into 1 super-sequence + 2D attention mask.
+ 
+    Super-sequence layout (per group g):
+        [group_g original teacher prefix tokens] [exp(s_i) for each s_i in group g]
+ 
+    Attention mask ensures each extraction point sees exactly the same context
+    as the original per-token sequence would have provided.
+ 
     Returns:
-        super_tokens:
-            List[int], shape L
-
-        attn_mask:
-            Bool Tensor, shape (L, L), True means can attend
-
-        position_ids:
-            List[int], shape L
-            Logical RoPE positions.
-
-        extract_pos:
-            List[int], physical positions in super_tokens from which to extract hidden states
-
-        valid_si:
-            List[int], student token indices corresponding to extract_pos
+        super_tokens:    List[int]   - token ids for the super-sequence
+        attn_mask:       Tensor (L, L) bool - True = can attend
+        extract_pos:     List[int]   - positions to extract hidden states from
+        valid_si:        List[int]   - which student indices these correspond to
     """
-
-    # ------------------------------------------------------------
-    # 0. Basic maps
-    # ------------------------------------------------------------
+    # Build student_idx -> (group_idx, position_in_group)
     s2g = {}
     s2p = {}
     for gi, sg in enumerate(s_groups):
         for p, si in enumerate(sg):
             s2g[si] = gi
             s2p[si] = p
-
-    num_groups = len(s_groups)
-    num_student_tokens = len(student_ids)
-
+    
     # teacher_prefix_lens[gi] = number of original teacher tokens before group gi
-    # This is exactly group_prefix_cache[gi]'s length in your fallback logic.
+    # This matches fallback's group_prefix_cache[gi].
     teacher_prefix_lens = []
     cur_teacher_len = 0
-    for gi in range(num_groups):
+    for gi in range(len(t_groups)):
         teacher_prefix_lens.append(cur_teacher_len)
         cur_teacher_len += len(t_groups[gi])
-
-    # ------------------------------------------------------------
-    # 1. Build P block: all original Qwen teacher tokens
-    # ------------------------------------------------------------
+ 
+    # === Lay out the super-sequence ===
     super_tokens = []
     position_ids = []
-
-    tok_group = []          # group index for each physical token
-    tok_is_expand = []      # False for P block, True for E block
-    tok_owner_si = []       # student index if E token, -1 if P token
-    tok_ingroup_pos = []    # position inside s_group if E token, -1 if P token
-    tok_expand_offset = []  # offset inside current expanded student token, -1 if P token
-
-    # P positions are original Qwen positions: 0, 1, 2, ...
-    # P block is physically and logically the full original Qwen sequence.
-    for gi in range(num_groups):
-        for local_t_pos, ti in enumerate(t_groups[gi]):
+    tok_group = []        # group index for each position
+    tok_is_expand = []    # True if expand token, False if prefix token
+    tok_owner_si = []     # student idx if expand, -1 if prefix
+    tok_ingroup_pos = []  # position-in-group of the owning student token, -1 if prefix
+ 
+    extract_positions = {}  # student_idx -> position in super_seq
+ 
+    for gi in range(len(s_groups)):
+        # Group prefix: original teacher tokens
+        for ti in t_groups[gi]:
             super_tokens.append(teacher_ids[ti])
-
-            # Since t_groups are built from teacher_ids order,
-            # teacher_prefix_lens[gi] + local_t_pos is the original teacher position.
-            position_ids.append(teacher_prefix_lens[gi] + local_t_pos)
-
             tok_group.append(gi)
             tok_is_expand.append(False)
             tok_owner_si.append(-1)
             tok_ingroup_pos.append(-1)
-            tok_expand_offset.append(-1)
-
-    p_block_len = len(super_tokens)
-
-    # ------------------------------------------------------------
-    # 2. Build E block: all expanded Llama-token pieces, in original student order
-    # ------------------------------------------------------------
-    extract_positions = {}
-
-    # For each group, we need to know how many expanded Qwen tokens appeared
-    # before each student token inside this group.
-    #
-    # This is used for logical position_ids:
-    #   pos(E(si, off)) =
-    #       teacher_prefix_len_before_group
-    #       + expanded_len_before_si_inside_group
-    #       + off
-    #
-    # This matches the original fallback virtual sequence:
-    #   original teacher prefix before group
-    #   + expanded previous student tokens inside group
-    #   + expanded current student token
-    for gi in range(num_groups):
-        expanded_len_so_far_in_group = 0
-
+ 
+        # Each student token's expand in this group
         for si in s_groups[gi]:
-            if si < 0 or si >= num_student_tokens:
-                continue
-
             p_in_g = s2p[si]
-            expanded = expand_map[si]
-
-            if not expanded:
-                continue
-
-            for off, tok_id in enumerate(expanded):
+            for tok_id in expand_map[si]:
                 super_tokens.append(tok_id)
-
-                logical_pos = (
-                    teacher_prefix_lens[gi]
-                    + expanded_len_so_far_in_group
-                    + off
-                )
-                position_ids.append(logical_pos)
-
                 tok_group.append(gi)
                 tok_is_expand.append(True)
                 tok_owner_si.append(si)
                 tok_ingroup_pos.append(p_in_g)
-                tok_expand_offset.append(off)
-
-            # Extract from the last token of this student's expanded piece.
+            # Extract from the last token of this expand
             extract_positions[si] = len(super_tokens) - 1
-
-            expanded_len_so_far_in_group += len(expanded)
-
+ 
     L = len(super_tokens)
-
-    if L == 0:
-        return [], None, [], [], []
-
-    # Physical length guard.
-    #
-    # Your original code used max_seq_len * 2 because supersequence contains
-    # both original teacher tokens and expanded tokens.
+ 
+    # Truncation fallback: if too long, we can't do single-pass.
+    # Return empty to signal caller should fall back to original method.
     if L > max_seq_len * 2:
-        return [], None, [], [], []
-
-    # Logical position guard.
-    #
-    # Even if physical length is okay, if logical RoPE position exceeds max_seq_len,
-    # it is safer to fallback to the original path.
-    if max(position_ids) + 1 > max_seq_len:
-        return [], None, [], [], []
-
-    # ------------------------------------------------------------
-    # 3. Vectorized attention mask
-    # ------------------------------------------------------------
-    t_group = torch.tensor(tok_group, dtype=torch.long)
+        return [], None, [], []
+ 
+    # === Build 2D attention mask (vectorized) ===
+    t_group_t = torch.tensor(tok_group, dtype=torch.long)
     t_is_exp = torch.tensor(tok_is_expand, dtype=torch.bool)
     t_is_pfx = ~t_is_exp
-    t_igp = torch.tensor(tok_ingroup_pos, dtype=torch.long)
-    t_owner_si = torch.tensor(tok_owner_si, dtype=torch.long)
-
-    gi_q = t_group.unsqueeze(1)     # (L, 1)
-    gi_k = t_group.unsqueeze(0)     # (1, L)
-
-    is_exp_q = t_is_exp.unsqueeze(1)
-    is_pfx_q = t_is_pfx.unsqueeze(1)
-
-    is_exp_k = t_is_exp.unsqueeze(0)
-    is_pfx_k = t_is_pfx.unsqueeze(0)
-
-    igp_q = t_igp.unsqueeze(1)
-    igp_k = t_igp.unsqueeze(0)
-
-    owner_q = t_owner_si.unsqueeze(1)
-    owner_k = t_owner_si.unsqueeze(0)
-
+    t_igp = torch.tensor(tok_ingroup_pos, dtype=torch.long)  # in-group position
+ 
+    # (L,1) vs (1,L) broadcasting for pairwise comparisons
+    gi_q = t_group_t.unsqueeze(1)   # query groups  (L, 1)
+    gi_k = t_group_t.unsqueeze(0)   # key groups    (1, L)
+    exp_k = t_is_exp.unsqueeze(0)   # key is expand (1, L)
+    pfx_k = t_is_pfx.unsqueeze(0)   # key is prefix (1, L)
+    igp_q = t_igp.unsqueeze(1)      # query in-group pos (L, 1)
+    igp_k = t_igp.unsqueeze(0)      # key in-group pos   (1, L)
+ 
     pos = torch.arange(L)
-    causal = pos.unsqueeze(1) >= pos.unsqueeze(0)
-
-    # ------------------------------------------------------------
-    # Rule A: P query tokens
-    #
-    # P block is the full original Qwen sequence.
-    # Prefix tokens should run as a normal causal language-model sequence
-    # inside P block only.
-    #
-    # They should not attend to E block.
-    # ------------------------------------------------------------
-    pfx_rule = is_pfx_k & causal
-
-    # ------------------------------------------------------------
-    # Rule B: E query tokens
-    #
-    # For an expanded token belonging to student token si in group gi,
-    # it should see exactly the original fallback virtual context:
-    #
-    #   1. P tokens from earlier groups only:
-    #        group_k < group_q and key is P
-    #
-    #      This corresponds to:
-    #        original teacher prefix before current group
-    #
-    #   2. E tokens from the same group and earlier student pieces:
-    #        group_k == group_q, key is E, ingroup_pos_k < ingroup_pos_q
-    #
-    #      This corresponds to:
-    #        within_prefix = expanded previous student tokens inside group
-    #
-    #   3. E tokens from the same student piece causally:
-    #        same owner_si and physical causal
-    #
-    #      This corresponds to:
-    #        current expanded token's causal prefix
-    #
-    # Important:
-    #   E query should NOT see:
-    #       - P tokens from the same group
-    #       - E tokens from previous groups
-    #       - E tokens from future groups
-    # ------------------------------------------------------------
-    e_rule = (
-        ((gi_k < gi_q) & is_pfx_k)
-        | ((gi_k == gi_q) & is_exp_k & (igp_k < igp_q))
-        | ((gi_k == gi_q) & is_exp_k & (owner_k == owner_q) & causal)
+    causal = pos.unsqueeze(0).T >= pos.unsqueeze(0)  # (L, L), causal[i,j] = (i >= j)
+ 
+    # --- Rules for PREFIX query positions ---
+    # Can see: earlier groups (all) | same group prefix (causal only)
+    pfx_rule = ((gi_k < gi_q) & pfx_k) | ((gi_k == gi_q) & pfx_k & causal)
+ 
+    # --- Rules for EXPAND query positions ---
+    # Can see:
+    #   1) All tokens from earlier groups
+    #   2) Same group, expand, earlier in-group position (all tokens of that expand)
+    #   3) Same group, expand, same in-group position, causal
+    #   4) Same group PREFIX: NOT visible (matches original code's prefix logic)
+    exp_rule = (
+        ((gi_k < gi_q) & pfx_k)
+        | ((gi_k == gi_q) & exp_k & (igp_k < igp_q))
+        | ((gi_k == gi_q) & exp_k & (igp_k == igp_q) & causal)
     )
-
-    attn_mask = torch.where(is_pfx_q, pfx_rule, e_rule)
-
-    # ------------------------------------------------------------
-    # 4. Collect extraction positions
-    # ------------------------------------------------------------
+ 
+    # Combine: use prefix rule for prefix queries, expand rule for expand queries
+    is_pfx_q = t_is_pfx.unsqueeze(1).expand(L, L)
+    attn_mask = torch.where(is_pfx_q, pfx_rule, exp_rule)
+ 
+    # === Collect extraction positions in student_ids order ===
     extract_pos_list = []
     valid_si_list = []
-
-    for si in range(num_student_tokens):
+    for si in range(len(student_ids)):
         if si in extract_positions:
             extract_pos_list.append(extract_positions[si])
             valid_si_list.append(si)
-
-    return super_tokens, attn_mask, position_ids, extract_pos_list, valid_si_list
+ 
+    return super_tokens, attn_mask, extract_pos_list, valid_si_list
  
  
 @torch.no_grad()
@@ -427,79 +334,45 @@ def teacher_forward_superseq(
     model: nn.Module,
     super_seq: List[int],
     attn_mask_2d: torch.Tensor,
-    position_ids: List[int],
     extract_positions: List[int],
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Single forward pass on the two-block super-sequence.
-
-    Key points:
-        1. attention_mask is a custom 4D additive mask.
-        2. position_ids are logical positions, not physical positions.
-        3. hidden states are extracted from E block positions.
+    [OPT-3] Single forward pass on the super-sequence.
+    
+    Returns: (N, hidden_dim) float32 tensor, one hidden state per extraction point.
     """
-
     model.eval()
-
     L = len(super_seq)
-
-    assert attn_mask_2d.shape == (L, L), (
-        f"attn_mask_2d shape {attn_mask_2d.shape} != ({L}, {L})"
-    )
-    assert len(position_ids) == L, (
-        f"len(position_ids)={len(position_ids)} != L={L}"
-    )
-
-    input_ids = torch.tensor(
-        [super_seq],
-        dtype=torch.long,
-        device=device,
-    )  # (1, L)
-
-    position_ids_tensor = torch.tensor(
-        [position_ids],
-        dtype=torch.long,
-        device=device,
-    )  # (1, L)
-
-    # Convert bool mask to 4D additive mask.
-    #
-    # HuggingFace attention convention:
-    #   0.0  = can attend
-    #   -inf = masked
-    mask_4d = attn_mask_2d.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, L, L)
-
+ 
+    input_ids = torch.tensor([super_seq], dtype=torch.long, device=device)  # (1, L)
+ 
+    # Convert bool mask to 4D float attention mask:
+    # HuggingFace convention: 0.0 = attend, -inf = masked
+    # Shape: (1, 1, L, L) — broadcast over batch and heads
+    mask_4d = attn_mask_2d.unsqueeze(0).unsqueeze(0).to(device)  # (1,1,L,L) bool
     attn_mask_float = torch.where(
         mask_4d,
         torch.tensor(0.0, dtype=dtype, device=device),
-        torch.tensor(float("-inf"), dtype=dtype, device=device),
+        torch.tensor(float('-inf'), dtype=dtype, device=device),
     )
-
+ 
     with torch.amp.autocast("cuda", dtype=dtype):
         outputs = model(
             input_ids=input_ids,
             attention_mask=attn_mask_float,
-            position_ids=position_ids_tensor,
             output_hidden_states=True,
             use_cache=False,
         )
-
-    last_hidden = outputs.hidden_states[-1]  # (1, L, hidden_dim)
-
-    positions = torch.tensor(
-        extract_positions,
-        dtype=torch.long,
-        device=device,
-    )
-
-    extracted = last_hidden[0, positions].float()  # (N, hidden_dim)
-
-    del outputs, last_hidden, input_ids, position_ids_tensor
-    del mask_4d, attn_mask_float, positions
+ 
+    last_hidden = outputs.hidden_states[-1]  # (1, L, hdim)
+    positions = torch.tensor(extract_positions, dtype=torch.long, device=device)
+    extracted = last_hidden[0, positions].float()  # (N, hdim)
+ 
+    del outputs, last_hidden, input_ids, mask_4d, attn_mask_float
     torch.cuda.empty_cache()
-
+ 
     return extracted
 
 def get_teacher_hidden_states(
@@ -512,60 +385,41 @@ def get_teacher_hidden_states(
 ) -> torch.Tensor:
     """
     Get teacher hidden states for all student tokens in a sample.
-
-    First tries the new two-block super-sequence path:
-
-        P block: all original Qwen tokens
-        E block: all expanded Llama pieces
-
-    Falls back to the original per-token batched path if the supersequence
-    is too long.
-
-    Returns:
-        Tensor of shape (n, hidden_dim), where n = len(student_ids).
+    
+    Tries the optimized single super-sequence path first [OPT-3].
+    Falls back to the original N-sequence batched path if the super-sequence
+    exceeds max_seq_len.
+    
+    Returns: (n, hidden_dim) tensor where n = len(student_ids)
     """
-
     s_ids = sample["s_ids"]
     t_ids = sample["t_ids"]
     sg = sample["sg"]
     tg = sample["tg"]
     em = sample["em"]
-
     n = len(s_ids)
     hdim = model.config.hidden_size
-
-    # --- New two-block super-sequence path ---
-    super_tokens, attn_mask, position_ids, extract_pos, valid_si = build_single_supersequence(
-        s_ids,
-        t_ids,
-        sg,
-        tg,
-        em,
-        max_seq_len,
+ 
+    # --- Try super-sequence path ---
+    super_tokens, attn_mask, extract_pos, valid_si = build_single_supersequence(
+        s_ids, t_ids, sg, tg, em, max_seq_len
     )
-
+ 
     if super_tokens and len(super_tokens) > 0:
+        # Super-sequence fits within max_seq_len: single forward pass
         hidden = teacher_forward_superseq(
-            model=model,
-            super_seq=super_tokens,
-            attn_mask_2d=attn_mask,
-            position_ids=position_ids,
-            extract_positions=extract_pos,
-            device=device,
-            dtype=dtype,
+            model, super_tokens, attn_mask, extract_pos, device, dtype
         )
-
-        result = torch.zeros(
-            n,
-            hdim,
-            dtype=torch.float32,
-            device=device,
-        )
-
+        # Map back to full student_ids ordering
+        result = torch.zeros(n, hdim, dtype=torch.float32, device=device)
         for idx, si in enumerate(valid_si):
             result[si] = hidden[idx]
-
         return result
+
+
+# ============================================================================
+# Projection Head
+# ============================================================================
 
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -575,6 +429,11 @@ class ProjectionHead(nn.Module):
 
     def forward(self, x):
         return F.linear(x, self.weight)
+
+
+# ============================================================================
+# Dataset
+# ============================================================================
 
 class PreprocessedDataset(Dataset):
     def __init__(self, texts, student_tok, teacher_tok, max_tokens, if_write_cache, cache_path=None):
@@ -621,6 +480,10 @@ class PreprocessedDataset(Dataset):
     def __getitems__(self, indices):
         return [self._data[i] for i in indices]
 
+
+# ============================================================================
+# Training
+# ============================================================================
 
 @dataclass
 class Config:
@@ -824,8 +687,3 @@ if __name__ == "__main__":
         output_dir=args.output_dir,if_write_cache=args.if_write_cache,cache_path = args.cache_path
     ))
     
-# torchrun --nproc_per_node=4 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
-
-# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
-
-# python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
