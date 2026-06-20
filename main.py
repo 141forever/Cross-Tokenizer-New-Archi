@@ -518,9 +518,6 @@ def get_teacher_hidden_states(
         P block: all original Qwen tokens
         E block: all expanded Llama pieces
 
-    Falls back to the original per-token batched path if the supersequence
-    is too long.
-
     Returns:
         Tensor of shape (n, hidden_dim), where n = len(student_ids).
     """
@@ -663,7 +660,7 @@ def run(cfg: Config):
             tok.pad_token = tok.eos_token
 
     # Student vocab size from tokenizer (no need to load the model)
-    s_vocab = s_tok.vocab_size
+    s_vocab = len(s_tok)
     if is_main(rank):
         logger.info(f"Student vocab size (from tokenizer): {s_vocab}")
 
@@ -819,6 +816,7 @@ if __name__ == "__main__":
         student_model=args.student_model, teacher_model=args.teacher_model,
         dataset_name=args.dataset_name, dataset_subset=args.dataset_subset,
         text_col=args.text_col, max_samples=args.max_samples, max_tokens=args.max_tokens,
+        max_seq_len=args.max_seq_len,
         batch_size=args.batch_size, teacher_bsz=args.teacher_bsz, lr=args.lr,
         epochs=args.epochs, grad_accum=args.grad_accum, dtype=args.dtype,
         output_dir=args.output_dir,if_write_cache=args.if_write_cache,cache_path = args.cache_path
@@ -826,6 +824,6 @@ if __name__ == "__main__":
     
 # torchrun --nproc_per_node=4 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
 
-# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
+# CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
 
 # python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
