@@ -13,7 +13,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DistributedSampler
@@ -155,10 +155,10 @@ def expand_student_tokens(student_ids, student_tok, teacher_tok):
     """Per student token → list of teacher token ids via decode + re-encode."""
     expand_map = []
     for sid in student_ids:
-        s = student_tok.decode([sid], skip_special_tokens=True)
+        s = student_tok.decode([sid], skip_special_tokens=False,clean_up_tokenization_spaces=False,)
         t_ids = teacher_tok.encode(s, add_special_tokens=False)
         if not t_ids:
-            t_ids = [teacher_tok.unk_token_id or 0]
+            raise ValueError("current student token can not be converted to teacher token!")
         expand_map.append(t_ids)
     return expand_map
 
@@ -322,14 +322,14 @@ def build_single_supersequence(
     #
     # Your original code used max_seq_len * 2 because supersequence contains
     # both original teacher tokens and expanded tokens.
-    if L > max_seq_len * 2:
+    if L > max_seq_len * 2.5:
         return [], None, [], [], []
 
     # Logical position guard.
     #
     # Even if physical length is okay, if logical RoPE position exceeds max_seq_len,
     # it is safer to fallback to the original path.
-    if max(position_ids) + 1 > max_seq_len:
+    if max(position_ids) + 1 > max_seq_len * 2.5:
         return [], None, [], [], []
 
     # ------------------------------------------------------------
@@ -540,6 +540,10 @@ def get_teacher_hidden_states(
         em,
         max_seq_len,
     )
+    
+    if len(super_tokens) == 0:
+        return None
+        
 
     if super_tokens and len(super_tokens) > 0:
         hidden = teacher_forward_superseq(
@@ -551,6 +555,8 @@ def get_teacher_hidden_states(
             device=device,
             dtype=dtype,
         )
+        
+        assert valid_si == list(range(n))
 
         result = torch.zeros(
             n,
@@ -668,7 +674,7 @@ def run(cfg: Config):
     if is_main(rank):
         logger.info("Loading teacher model (frozen)...")
     t_model = AutoModelForCausalLM.from_pretrained(
-        cfg.teacher_model, torch_dtype=dt, 
+        cfg.teacher_model, dtype=dt, attn_implementation="sdpa",
     ).to(dev) 
     t_model.eval()
     for p in t_model.parameters():
@@ -684,14 +690,18 @@ def run(cfg: Config):
     # Data
     if is_main(rank):
         logger.info("Loading data...")
-    ds = Dataset.from_parquet(cfg.dataset_name)
-    texts = []
-    for i, x in enumerate(ds):
-        if i >= cfg.max_samples and cfg.max_samples != -1:
-            break
-        t = x.get(cfg.text_col, "")
-        if len(t.strip()) > 20:
-            texts.append(t)
+    
+    if not cfg.if_write_cache:
+        texts = []
+    else:
+        ds = Dataset.from_parquet(cfg.dataset_name)
+        texts = []
+        for i, x in enumerate(ds):
+            if i >= cfg.max_samples and cfg.max_samples != -1:
+                break
+            t = x.get(cfg.text_col, "")
+            if len(t.strip()) > 20:
+                texts.append(t)
             
     cache = cfg.cache_path if cfg.cache_path else None
     
@@ -704,7 +714,8 @@ def run(cfg: Config):
 
     # Optimizer
     opt = torch.optim.AdamW(proj_ddp.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
-    total_steps = (len(loader) * cfg.epochs) // cfg.grad_accum
+    steps_per_epoch = math.ceil(len(loader) / cfg.grad_accum)
+    total_steps = steps_per_epoch * cfg.epochs
     warmup_steps = int(total_steps * cfg.warmup)
     sched = get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
 
@@ -712,14 +723,16 @@ def run(cfg: Config):
         logger.info(f"Training: {cfg.epochs} epochs, {total_steps} optimizer steps")
 
     step = 0
-    loss_accum = 0.0
-    loss_count = 0
+    accum_token_count = 0
+    log_loss_sum = 0.0
+    log_token_count = 0
+    opt.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.epochs):
         sampler.set_epoch(epoch)
         for bi, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}",disable=not is_main(rank))):
-            batch_loss = torch.tensor(0.0, device=dev)
-            valid = 0
+            batch_loss_sum = torch.tensor(0.0, device=dev)
+            batch_token_count = 0
 
             for sample in batch:
                 s_ids = sample["s_ids"]
@@ -731,6 +744,10 @@ def run(cfg: Config):
                 t_hidden = get_teacher_hidden_states(
                     sample, t_model, cfg.max_seq_len, cfg.teacher_bsz, dev, dt
                 )  # (n, hdim)
+                
+                if t_hidden is None:
+                    continue
+                
                 t_hidden = t_hidden.to(dev)
  
                 assert t_hidden.shape[0] == n
@@ -744,37 +761,77 @@ def run(cfg: Config):
                     s_ids[1:], dtype=torch.long, device=dev
                 )  # (n-1,)
 
-                ntp_loss = F.cross_entropy(logits_for_loss, labels)
-                batch_loss = batch_loss + ntp_loss
-                valid += 1
+                ntp_loss_sum = F.cross_entropy(
+                    logits_for_loss.float(),
+                    labels,
+                    reduction="sum",
+                )
+
+                batch_loss_sum = batch_loss_sum + ntp_loss_sum
+                batch_token_count += labels.numel()
 
                 del t_hidden, proj_logits, logits_for_loss, labels
                 torch.cuda.empty_cache()
 
-            if valid > 0:
-                loss = batch_loss / (valid * cfg.grad_accum)
-                loss.backward()
-                loss_accum += loss.item() * cfg.grad_accum
-                loss_count += 1
+            if batch_token_count > 0:
+                batch_loss_sum.backward()
+                accum_token_count += batch_token_count
+                log_loss_sum += batch_loss_sum.detach().float().item()
+                log_token_count += batch_token_count
+                
 
-            if (bi + 1) % cfg.grad_accum == 0:
-                nn.utils.clip_grad_norm_(proj_ddp.parameters(), cfg.grad_clip)
+            if (bi + 1) % cfg.grad_accum == 0 or (bi + 1) == len(loader):
+                if accum_token_count == 0:
+                    opt.zero_grad(set_to_none=True)
+                    continue
+                
+                grad_scale = 1.0 / accum_token_count
+
+                for param in proj_ddp.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(grad_scale)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    proj_ddp.parameters(),
+                    cfg.grad_clip,
+                )
+
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
+
                 step += 1
-
+                accum_token_count = 0
+                
                 if is_main(rank) and step % cfg.log_every == 0:
-                    avg = loss_accum / max(loss_count, 1)
-                    logger.info(f"[Step {step}/{total_steps}] loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e}")
-                    loss_accum = 0.0
-                    loss_count = 0
+                    avg_loss = (
+                        log_loss_sum / max(log_token_count, 1)
+                    )
 
+                    logger.info(
+                        f"[Step {step}/{total_steps}] "
+                        f"loss={avg_loss:.4f} "
+                        f"ppl={math.exp(min(avg_loss, 20)):.4f} "
+                        f"tokens={log_token_count} "
+                        f"grad_norm={float(grad_norm):.4f} "
+                        f"lr={sched.get_last_lr()[0]:.2e}"
+                    )
+
+                    log_loss_sum = 0.0
+                    log_token_count = 0
+                    
                 if is_main(rank) and step % cfg.save_every == 0:
-                    p = os.path.join(cfg.output_dir, f"proj_step{step}.pt")
-                    torch.save(proj_ddp.module.state_dict(), p)
+                    p = os.path.join(
+                        cfg.output_dir,
+                        f"proj_step{step}.pt",
+                    )
+
+                    torch.save(
+                        proj_ddp.module.state_dict(),
+                        p,
+                    )
+
                     logger.info(f"Saved → {p}")
-        
+            
         if is_main(rank):
             p = os.path.join(cfg.output_dir, f"proj_epoch{epoch+1}.pt")
             torch.save(proj_ddp.module.state_dict(), p)
@@ -794,7 +851,7 @@ if __name__ == "__main__":
     pa.add_argument("--student_model", default="meta-llama/Llama-3.2-1B",
                      help="Student model name (only tokenizer is loaded)")
     pa.add_argument("--teacher_model", default="Qwen/Qwen2.5-1.5B")
-    pa.add_argument("--dataset_name", default="HuggingFaceTB/smollm-corpus")
+    pa.add_argument("--dataset_name", default="local path/any parquet path here")
     pa.add_argument("--dataset_subset", default="cosmopedia-v2")
     pa.add_argument("--text_col", default="text")
     pa.add_argument("--max_samples", type=int, default=-1,help="The number of samples from source data (before preprocessed). -1 means 'all'. ")
@@ -804,9 +861,11 @@ if __name__ == "__main__":
     pa.add_argument("--teacher_bsz", type=int, default=32)
     pa.add_argument("--lr", type=float, default=1e-5)
     pa.add_argument("--epochs", type=int, default=1)
-    pa.add_argument("--grad_accum", type=int, default=1)
+    pa.add_argument("--grad_accum", type=int, default=1,help="it is better to set to 1.")
     pa.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16"])
     pa.add_argument("--output_dir", default="output_projection")
+    pa.add_argument("--save_every", type=int, default=1000)
+    pa.add_argument("--log_every", type=int, default=10)
     pa.add_argument("--if_write_cache",  action="store_true", help="If set, the preprocessing stage will start and a pickle file will be written.")
     pa.add_argument("--cache_path", default=None,
                     help="The processed data path. Must be set.")
@@ -819,11 +878,14 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         batch_size=args.batch_size, teacher_bsz=args.teacher_bsz, lr=args.lr,
         epochs=args.epochs, grad_accum=args.grad_accum, dtype=args.dtype,
-        output_dir=args.output_dir,if_write_cache=args.if_write_cache,cache_path = args.cache_path
+        output_dir=args.output_dir,if_write_cache=args.if_write_cache,cache_path = args.cache_path,save_every=args.save_every,log_every=args.log_every,
     ))
     
 # torchrun --nproc_per_node=4 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
 
-# CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
+# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/weight/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/data/pretrain_nemotron_diverseQA_part1_100.pkl --if_write_cache
 
 # python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
+
+
+# 强烈建议这份代码一定要单卡处理数据单卡训练
