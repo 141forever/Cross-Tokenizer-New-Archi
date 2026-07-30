@@ -1,3 +1,9 @@
+'''
+Although this version contains mutiple ranks,
+We recommend a single-gpu data processing and training version.
+Multi-GPU setups can cause issues.
+'''
+
 import os
 import math
 import logging
@@ -5,8 +11,9 @@ import json
 import pdb
 import time
 import pickle
+import wandb
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from typing import Optional, List, Tuple, Dict, Any
 from collections import defaultdict
 
@@ -19,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DistributedSampler
 
 from transformers import (
+    AddedToken,
     AutoModelForCausalLM,
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
@@ -223,8 +231,7 @@ def build_single_supersequence(
     num_groups = len(s_groups)
     num_student_tokens = len(student_ids)
 
-    # teacher_prefix_lens[gi] = number of original teacher tokens before group gi
-    # This is exactly group_prefix_cache[gi]'s length in your fallback logic.
+    # teacher_prefix_lens[gi] = number of original teacher tokens before group gi.
     teacher_prefix_lens = []
     cur_teacher_len = 0
     for gi in range(num_groups):
@@ -274,11 +281,6 @@ def build_single_supersequence(
     #       teacher_prefix_len_before_group
     #       + expanded_len_before_si_inside_group
     #       + off
-    #
-    # This matches the original fallback virtual sequence:
-    #   original teacher prefix before group
-    #   + expanded previous student tokens inside group
-    #   + expanded current student token
     for gi in range(num_groups):
         expanded_len_so_far_in_group = 0
 
@@ -328,8 +330,7 @@ def build_single_supersequence(
     # Logical position guard.
     #
     # Even if physical length is okay, if logical RoPE position exceeds max_seq_len,
-    # it is safer to fallback to the original path.
-    if max(position_ids) + 1 > max_seq_len * 2.5:
+    if max(position_ids) + 1 > max_seq_len *2 :
         return [], None, [], [], []
 
     # ------------------------------------------------------------
@@ -372,27 +373,6 @@ def build_single_supersequence(
 
     # ------------------------------------------------------------
     # Rule B: E query tokens
-    #
-    # For an expanded token belonging to student token si in group gi,
-    # it should see exactly the original fallback virtual context:
-    #
-    #   1. P tokens from earlier groups only:
-    #        group_k < group_q and key is P
-    #
-    #      This corresponds to:
-    #        original teacher prefix before current group
-    #
-    #   2. E tokens from the same group and earlier student pieces:
-    #        group_k == group_q, key is E, ingroup_pos_k < ingroup_pos_q
-    #
-    #      This corresponds to:
-    #        within_prefix = expanded previous student tokens inside group
-    #
-    #   3. E tokens from the same student piece causally:
-    #        same owner_si and physical causal
-    #
-    #      This corresponds to:
-    #        current expanded token's causal prefix
     #
     # Important:
     #   E query should NOT see:
@@ -571,17 +551,163 @@ def get_teacher_hidden_states(
         return result
 
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim, out_dim):
+    def __init__(
+        self,
+        teacher_model,
+        student_tokenizer,
+        teacher_tokenizer,
+        dtype=torch.float32,
+        init_head_path: Optional[str] = None,
+    ):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_dim, in_dim))
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, x):
-        return F.linear(x, self.weight)
+        if init_head_path is not None:
+            ckpt = torch.load(init_head_path, map_location="cpu", weights_only=True)
+            weight_tensor = ckpt["weight"] if isinstance(ckpt, dict) else ckpt
+            expected_shape = (len(student_tokenizer), teacher_model.config.hidden_size)
+            if tuple(weight_tensor.shape) != expected_shape:
+                raise ValueError(f"Shape mismatch: {tuple(weight_tensor.shape)} vs {expected_shape}")
+            self.weight = nn.Parameter(weight_tensor.to(dtype=dtype))
+            return
+
+        # 取得 teacher 原始 LM head 的权重：
+        # shape = [teacher_vocab_size, hidden_size]
+        teacher_weight = teacher_model.get_output_embeddings().weight.detach()
+
+        # 取得 teacher 词表大小和 hidden size。
+        teacher_vocab_size, hidden_size = teacher_weight.shape
+
+        # 取得 student 词表大小。
+        student_vocab_size = len(student_tokenizer)
+
+        # 创建完整的新 LM head 初始化权重。
+        # shape = [student_vocab_size, hidden_size]
+        init_weight = torch.empty(
+            student_vocab_size,
+            hidden_size,
+            dtype=dtype,
+            device=teacher_weight.device,
+        )
+
+        # 统计有多少 token 可以直接复制。
+        shared_count = 0
+
+        # 统计有多少 token 使用平均初始化。
+        averaged_count = 0
+
+        # 初始化 student 词表中的每一行。
+        for student_id in range(student_vocab_size):
+
+            # 将当前 student token 单独解码成文本。
+            token_text = student_tokenizer.decode(
+                [student_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+
+            # 使用 teacher tokenizer 编码相同文本。
+            teacher_ids = teacher_tokenizer.encode(
+                token_text,
+                add_special_tokens=False,
+            )
+
+            # 过滤异常或越界的 teacher token ID。
+            teacher_ids = [
+                teacher_id
+                for teacher_id in teacher_ids
+                if 0 <= teacher_id < teacher_vocab_size
+            ]
+
+            # 判断该 token 是否同时存在于 student 和 teacher 词表中。
+            is_shared = False
+
+            # 如果 teacher 也将该文本编码成一个 token，
+            # 则进一步检查双方解码文本是否完全一致。
+            if len(teacher_ids) == 1:
+                teacher_id = teacher_ids[0]
+
+                teacher_token_text = teacher_tokenizer.decode(
+                    [teacher_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+
+                if teacher_token_text == token_text:
+                    is_shared = True
+
+            if is_shared:
+                # 共享 token：
+                # 直接复制 teacher LM head 中对应 token 的行。
+                init_weight[student_id].copy_(
+                    teacher_weight[teacher_ids[0]].to(dtype)
+                )
+
+                shared_count += 1
+
+            else:
+                # 非共享 token：
+                # teacher tokenizer 理论上应将其拆成一个或多个 token。
+                if len(teacher_ids) == 0:
+                    # 极端情况下无法编码，则使用 unk token。
+                    fallback_id = teacher_tokenizer.unk_token_id
+
+                    # 如果没有 unk token，则使用 eos token。
+                    if fallback_id is None:
+                        fallback_id = teacher_tokenizer.eos_token_id
+
+                    # 如果仍然没有可用 token，则报错。
+                    if fallback_id is None:
+                        raise ValueError(
+                            f"Cannot initialize student token "
+                            f"{student_id}: {token_text!r}"
+                        )
+
+                    teacher_ids = [fallback_id]
+
+                # 将 teacher token IDs 转成 Tensor。
+                teacher_ids_tensor = torch.tensor(
+                    teacher_ids,
+                    dtype=torch.long,
+                    device=teacher_weight.device,
+                )
+
+                # 取出组成该 student token 的多个 teacher LM-head 行。
+                teacher_rows = teacher_weight.index_select(
+                    0,
+                    teacher_ids_tensor,
+                )
+
+                # 对这些 teacher LM-head 行求平均，
+                # 作为当前 student token 对应行的初始化。
+                init_weight[student_id].copy_(
+                    teacher_rows.mean(dim=0).to(dtype)
+                )
+
+                averaged_count += 1
+
+        # 将整个完整 LM head 注册为一个可训练参数。
+        # 共享 token 行和非共享 token 行都会继续训练。
+        self.weight = nn.Parameter(init_weight)
+
+        logger.info(
+            "Projection head initialized from teacher LM head: "
+            f"shared={shared_count}, "
+            f"averaged={averaged_count}, "
+            f"total={student_vocab_size}"
+        )
+
+    def forward(self, hidden_states):
+        # 使用标准 LM-head 线性映射：
+        # [..., hidden_size] → [..., student_vocab_size]
+        return F.linear(
+            hidden_states.to(self.weight.dtype),
+            self.weight,
+        )
 
 class PreprocessedDataset(Dataset):
-    def __init__(self, texts, student_tok, teacher_tok, max_tokens, if_write_cache, cache_path=None):
+    def __init__(self, texts, student_tok, teacher_tok, max_tokens, if_write_cache, cache_path:str,reasoning_token_ids: Optional[Dict[str, int]] = None):
         self._data = []
+        self.reasoning_token_counts = defaultdict(int)
         if not cache_path:
             raise ValueError("cache_path must not be set !!!")
         
@@ -614,6 +740,15 @@ class PreprocessedDataset(Dataset):
                 pickle.dump(self._data, f, protocol=pickle.HIGHEST_PROTOCOL)
             logger.info(f"Cache saved to {cache_path}")
         logger.info(f"Dataset: {len(self._data)}/{len(texts)} samples ready")
+        
+        # Count reasoning token occurrences in cache.
+        if reasoning_token_ids:
+            id_to_tok = {v: k for k, v in reasoning_token_ids.items()}
+            for sample in self._data:
+                for sid in sample.get("s_ids", []):
+                    if sid in id_to_tok:
+                        self.reasoning_token_counts[id_to_tok[sid]] += 1
+            logger.info(f"Reasoning token counts in processed cache: {dict(self.reasoning_token_counts)}")
 
     def __len__(self):
         return len(self._data)
@@ -624,6 +759,37 @@ class PreprocessedDataset(Dataset):
     def __getitems__(self, indices):
         return [self._data[i] for i in indices]
 
+def add_reasoning_tokens(tokenizer, reasoning_tokens: List[str], rank: int = 0) -> Dict[str, int]:
+    """
+    Add normal added tokens, not reasoning tokens.
+
+    This makes <think>, </think>, <answer>, </answer> become atomic tokens,
+    but they will not be removed by decode(..., skip_special_tokens=True).
+    """
+
+    added = []
+
+    for tok in reasoning_tokens:
+        added.append(
+            AddedToken(
+                tok,
+                special=False,
+                normalized=False,
+                lstrip=False,
+                rstrip=False,
+                single_word=False,
+            )
+        )
+
+    num_added = tokenizer.add_tokens(added, special_tokens=False)
+
+    token_ids = {tok: tokenizer.convert_tokens_to_ids(tok) for tok in reasoning_tokens}
+
+    if is_main(rank):
+        logger.info(f"Added {num_added} new student normal tokens.")
+        logger.info(f"SFT token ids: {token_ids}")
+
+    return token_ids
 
 @dataclass
 class Config:
@@ -649,9 +815,22 @@ class Config:
     output_dir: str = "output_projection"
     if_write_cache: bool = False
     cache_path: str = None
+    init_head_path: Optional[str] = None
+    reasoning_tokens: List[str] = field(default_factory=lambda: ["<think>", "</think>", "<answer>", "</answer>"])
 
 
 def run(cfg: Config):
+    wandb.login(
+        key="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"
+    )
+
+    wandb.init(
+        project="llama_lm_head_pretrain",
+        name="global_3_countdowm",
+    )
+    #TODO
+
+
     rank, world_size, local_rank = setup_ddp()
     dev = torch.device(f"cuda:{local_rank}")
     
@@ -661,6 +840,9 @@ def run(cfg: Config):
     # Tokenizers (student model is NOT loaded, only its tokenizer)
     s_tok = AutoTokenizer.from_pretrained(cfg.student_model)
     t_tok = AutoTokenizer.from_pretrained(cfg.teacher_model)
+    
+    reasoning_token_ids = add_reasoning_tokens(s_tok, cfg.reasoning_tokens, rank=rank)
+    
     for tok in (s_tok, t_tok):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
@@ -669,6 +851,31 @@ def run(cfg: Config):
     s_vocab = len(s_tok)
     if is_main(rank):
         logger.info(f"Student vocab size (from tokenizer): {s_vocab}")
+        
+    if is_main(rank):
+        logger.info(f"Student base vocab_size: {s_tok.vocab_size}")
+        logger.info(f"Student len(tokenizer): {len(s_tok)}")
+        logger.info(f"Student max token id + 1: {max(s_tok.get_vocab().values())+1}")
+        logger.info(f"Projection output dim: {s_vocab}")
+
+        tok_out = Path(cfg.output_dir) / "student_tokenizer_with_reasoning_tokens"
+        s_tok.save_pretrained(tok_out)
+        with open(Path(cfg.output_dir) / "reasoning_token_ids.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "reasoning_token_ids": reasoning_token_ids,
+                    "projection_vocab_size": s_vocab,
+                    "student_vocab_size_base": s_tok.vocab_size,
+                    "student_len_tokenizer": len(s_tok),
+                    "student_max_token_id_plus_1": max(s_tok.get_vocab().values())+1,
+                },
+                f,
+                ensure_ascii=False,
+                indent=4,
+            )
+        logger.info(f"Saved augmented student tokenizer to {tok_out}")
+    if world_size > 1:
+        dist.barrier()
 
     # Teacher model (frozen, only need hidden states)
     if is_main(rank):
@@ -684,7 +891,13 @@ def run(cfg: Config):
     if is_main(rank):
         logger.info(f"Projection: {t_hdim} → {s_vocab}")
 
-    proj = ProjectionHead(t_hdim, s_vocab).to(dev)
+    proj = ProjectionHead(
+        teacher_model=t_model,
+        student_tokenizer=s_tok,
+        teacher_tokenizer=t_tok,
+        dtype=torch.float32,
+        init_head_path=cfg.init_head_path,
+        ).to(dev)
     proj_ddp = DDP(proj, device_ids=[local_rank], find_unused_parameters=False)
 
     # Data
@@ -706,7 +919,30 @@ def run(cfg: Config):
     cache = cfg.cache_path if cfg.cache_path else None
     
     dataset = PreprocessedDataset(texts, s_tok, t_tok, cfg.max_tokens, cfg.if_write_cache,
-                              cache_path=cache)
+                              cache_path=cache,reasoning_token_ids=reasoning_token_ids)
+
+    '''
+    Multi-gpu WARNING:
+    Each rank reads the data independently, which may cause congestion.
+    '''
+    
+    if len(dataset) == 0:
+        raise RuntimeError("No valid samples after preprocessing/loading cache.")
+
+    max_sid = max(max(x["s_ids"]) for x in dataset._data if len(x["s_ids"]) > 0)
+    min_sid = min(min(x["s_ids"]) for x in dataset._data if len(x["s_ids"]) > 0)
+    if is_main(rank):
+        logger.info(f"Cache student token id range: [{min_sid}, {max_sid}]")
+    if max_sid >= s_vocab:
+        raise ValueError(f"Token id out of range: max_sid={max_sid}, projection_vocab_size={s_vocab}")
+    if is_main(rank) and cfg.reasoning_tokens and sum(dataset.reasoning_token_counts.values()) == 0:
+        logger.warning(
+            "No reasoning tokens found in processed cache. "
+            "If your corpus contains <think>/<answer> tags, rebuild cache with --if_write_cache "
+            "after adding these reasoning tokens."
+        )
+
+
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                              shuffle=True, drop_last=True)
     loader  = DataLoader(dataset, batch_size=cfg.batch_size, sampler=sampler,
@@ -722,10 +958,16 @@ def run(cfg: Config):
     if is_main(rank):
         logger.info(f"Training: {cfg.epochs} epochs, {total_steps} optimizer steps")
 
-    step = 0
+    step = 15000 #TODO
     accum_token_count = 0
     log_loss_sum = 0.0
     log_token_count = 0
+    
+    track_token_loss_sum = defaultdict(float)
+    track_token_count = defaultdict(int)
+    id_to_reasoning_tok = {v: k for k, v in reasoning_token_ids.items()}
+    track_ids = set(id_to_reasoning_tok.keys())
+    
     opt.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.epochs):
@@ -755,10 +997,22 @@ def run(cfg: Config):
                 # Projection → NTP Cross-Entropy
                 # proj_logits[i] predicts student_ids[i+1]
                 proj_logits = proj_ddp(t_hidden.detach())  # (n, s_vocab), WITH grad
+                
+                eos_id = s_tok.eos_token_id
+                if eos_id is None:
+                    raise ValueError("Student tokenizer has no eos_token_id.")
 
-                logits_for_loss = proj_logits[:-1]  # (n-1, s_vocab)
+                if s_ids[-1] == eos_id:
+                    # Cache 中已经包含 EOS
+                    logits_for_loss = proj_logits[:-1]
+                    target_ids = s_ids[1:]
+                else:
+                    # Cache 中没有 EOS：让最后一个位置预测 EOS
+                    logits_for_loss = proj_logits
+                    target_ids = s_ids[1:] + [eos_id]
+
                 labels = torch.tensor(
-                    s_ids[1:], dtype=torch.long, device=dev
+                    target_ids, dtype=torch.long, device=dev
                 )  # (n-1,)
 
                 ntp_loss_sum = F.cross_entropy(
@@ -784,8 +1038,19 @@ def run(cfg: Config):
                 if accum_token_count == 0:
                     opt.zero_grad(set_to_none=True)
                     continue
+                '''
+                Multi-gpu WARNING:
+                Some ranks may have an accum_token_count == 0, which can lead to a hang."
+                '''
                 
-                grad_scale = 1.0 / accum_token_count
+                grad_scale = world_size / accum_token_count
+                
+                '''
+                Multi-gpu WARNING:
+                By default, gradients are averaged based on the number of ranks. 
+                Since each rank may accumulate a different number of tokens, the resulting gradients will differ. 
+                Therefore, in a multi-GPU setting, you must normalize by the total number of tokens across all ranks rather than just the current rank.
+                '''
 
                 for param in proj_ddp.parameters():
                     if param.grad is not None:
@@ -805,6 +1070,17 @@ def run(cfg: Config):
                 if is_main(rank) and step % cfg.log_every == 0:
                     avg_loss = (
                         log_loss_sum / max(log_token_count, 1)
+                    )
+                    
+                    wandb.log(
+                        {
+                            "train/loss": avg_loss,
+                            "train/ppl": torch.exp(
+                                torch.tensor(avg_loss)
+                            ).item(),
+                            "step": step,
+                        },
+                        step=step,
                     )
 
                     logger.info(
@@ -869,6 +1145,17 @@ if __name__ == "__main__":
     pa.add_argument("--if_write_cache",  action="store_true", help="If set, the preprocessing stage will start and a pickle file will be written.")
     pa.add_argument("--cache_path", default=None,
                     help="The processed data path. Must be set.")
+    pa.add_argument(
+        "--init_head_path",
+        default=None,
+        help="Optional old projection head path. Old rows will be copied into the new larger head.",
+    )
+    pa.add_argument(
+        "--reasoning_tokens",
+        nargs="*",
+        default=["<think>", "</think>", "<answer>", "</answer>"],
+        help="Reasoning tokens added to the student tokenizer and projection head output space.",
+    )
     args = pa.parse_args()
 
     run(Config(
@@ -879,13 +1166,12 @@ if __name__ == "__main__":
         batch_size=args.batch_size, teacher_bsz=args.teacher_bsz, lr=args.lr,
         epochs=args.epochs, grad_accum=args.grad_accum, dtype=args.dtype,
         output_dir=args.output_dir,if_write_cache=args.if_write_cache,cache_path = args.cache_path,save_every=args.save_every,log_every=args.log_every,
+        init_head_path=args.init_head_path,
+        reasoning_tokens=args.reasoning_tokens,
     ))
     
 # torchrun --nproc_per_node=4 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
 
-# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/weight/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/data/pretrain_nemotron_diverseQA_part1_100.pkl --if_write_cache
+# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/weight/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/data/pretrain_nemotron_HighQualitySynthetic_part000000.pkl --init_head_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/weight/qwen_original_lm_head.pt
 
 # python main.py --student_model /inspire/hdd/project/smarteducation/public/models/Llama-3.2-1B-Instruct --teacher_model /inspire/hdd/project/smarteducation/public/models/Qwen3-4B-Instruct --dataset_name /inspire/dataset/nemotron-cc-v2/v1/Diverse-QA/part_000000.parquet --output_dir /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/output --batch_size 48 --max_tokens 4096 --max_seq_len 4096 --max_samples -1 --text_col text --cache_path /inspire/hdd/project/smarteducation/chenkedi-253108120128/Cross-Tokenizer-New-Archi/pretrain_nemotron_diverseQA_part1.pkl
-
-
-# 强烈建议这份代码一定要单卡处理数据单卡训练
